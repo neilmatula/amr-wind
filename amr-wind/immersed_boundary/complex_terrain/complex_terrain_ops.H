@@ -112,9 +112,13 @@ struct ComputeSourceOp<
         const auto& phi_arr = level(lev).array(mfi);
         const auto& norm_arr = normal(lev).array(mfi);
         auto sarr = source(lev).array(mfi);
+        const auto& dx = geom.CellSizeArray();
+        const auto& problo = geom.ProbLoArray();
 
         const amrex::Real cd = data.meta().drag_coefficient;
         const amrex::Real eps = data.meta().eps_spread;
+
+        const amrex::Real h = dx[2];
 
         amrex::ParallelFor(
             bx, [=] AMREX_GPU_DEVICE(int i, int j, int k) noexcept {
@@ -123,12 +127,87 @@ struct ComputeSourceOp<
                 const amrex::Vector<amrex::Real> norm = {
                     {norm_arr(i, j, k, 0), norm_arr(i, j, k, 1),
                      norm_arr(i, j, k, 2)}};
-                // Outside the band if the normal vector is assigned to be zero
-                // normal vector will only be ~1 or ~0 so 0.5 is a safe value
-                // that to confirm we are in the band where the wall model is
-                // active
+
+                /* const vs::Vector cc{
+                    problo[0] + (i + 0.5) * dx[0],
+                    problo[1] + (j + 0.5) * dx[1],
+                    problo[2] + (k + 0.5) * dx[2],
+                }; */
+
+                // Outside the band if the normal vector is assigned to be
+                // zero normal vector will only be ~1 or ~0 so 0.5 is a safe
+                // value that to confirm we are in the band where the wall
+                // model is active
                 const amrex::Real nmag = utils::vec_mag(norm.data());
                 if (nmag > 0.5) {
+
+                    // nmatula todo
+                    // account for the case where the point below would be below
+                    // the bottom boundary
+
+                    const amrex::Real z_cell_centroid =
+                        problo[2] + (k + 0.5) * dx[2];
+                    const amrex::Real phi_cell_centroid = phi_arr(i, j, k);
+                    // nmatula I did it like this because, when we do 3D curvy
+                    // stuff, we're going to march from the cell centroid, in
+                    // the direction of the normal, by a step equal to
+                    // h - phi_cell_centroid
+                    const amrex::Real z_outside_band =
+                        z_cell_centroid + h - phi_cell_centroid;
+                    // const amrex::Real z_outside_band =
+                    //     z_cell_centroid + h / 2 + 0.00001;
+                    //  nmatula todo use different floor function to avoid float
+                    //  to int conversion
+                    const int bounding_cell =
+                        floor((z_outside_band - problo[2]) / h);
+                    const amrex::Real z_bounding_cell =
+                        problo[2] + (bounding_cell + 0.5) * dx[2];
+                    const amrex::Real u_bounding_cell =
+                        varr(i, j, bounding_cell, 0);
+
+                    // Linear interpolation in z for now
+                    // Will probably be trilinear interpolation in the general
+                    // case (hill)
+                    amrex::Real u_interp;
+                    if (z_bounding_cell >= z_outside_band) {
+                        const amrex::Real z_below =
+                            problo[2] + (bounding_cell - 0.5) * dx[2];
+                        const amrex::Real u_below =
+                            varr(i, j, bounding_cell - 1, 0);
+                        u_interp = u_below + (z_outside_band - z_below) *
+                                                 (u_bounding_cell - u_below) /
+                                                 (z_bounding_cell - z_below);
+                    } else {
+                        const amrex::Real z_above =
+                            problo[2] + (bounding_cell + 1.5) * dx[2];
+                        const amrex::Real u_above =
+                            varr(i, j, bounding_cell + 1, 0);
+                        u_interp = u_bounding_cell +
+                                   (z_outside_band - z_bounding_cell) *
+                                       (u_above - u_bounding_cell) /
+                                       (z_above - z_bounding_cell);
+                    }
+
+                    // debug output
+                    if (1 == 0) {
+                        std::cerr << "h:                   " << h << std::endl;
+                        std::cerr
+                            << "phi_cell_centroid:   " << phi_cell_centroid
+                            << std::endl;
+                        std::cerr << "z_cell_centroid:     " << z_cell_centroid
+                                  << std::endl;
+                        std::cerr << "z_outside_band:      " << z_outside_band
+                                  << std::endl;
+                        std::cerr << "IB height:           "
+                                  << z_cell_centroid - phi_cell_centroid
+                                  << std::endl;
+                        std::cerr << "bounding cell index: " << bounding_cell
+                                  << std::endl;
+                        std::cerr << "band cell index      " << k << std::endl;
+
+                        // exit(1);
+                    }
+
                     const amrex::Real vdotn =
                         utils::dot_prod(norm.data(), vel.data());
                     const auto gauss_fac = actuator::utils::gaussian1d(
@@ -139,14 +218,29 @@ struct ComputeSourceOp<
                          vel[2] - vdotn * norm[2]}};
                     // Get tangent velocity magnitude
                     const amrex::Real vtmag = utils::vec_mag(vtan.data());
-                    // Calculate drag force C_D * 0.5 * rho * vtmag^2
-                    // vtan already has one factor of vtmag in it, so there's no
-                    // need to normalize, just leave off a factor in the
-                    // coefficient.
-                    const amrex::Real force = -cd / vtmag;
-                    sarr(i, j, k, 0) += force * vtan[0];
-                    sarr(i, j, k, 1) += force * vtan[1];
-                    sarr(i, j, k, 2) += force * vtan[2];
+
+                    // Old thing
+                    // const amrex::Real divt = -cd / vtmag;
+
+                    // todo
+                    // Hard coded random z0 for now
+                    // Can either pull from ABL z0 in input file, or have an
+                    // IB-specific parameter in input file
+                    const amrex::Real z0 = 0.000001;
+
+                    // todo pull kappa from correct place
+                    const amrex::Real kappa = 0.4;
+
+                    // Still got the factor of vtmag because vtan is
+                    // unnormalized
+                    // (divt is a bad name)
+                    const amrex::Real divt =
+                        -2.0 / phi_arr(i, j, k) /
+                        pow(log(phi_arr(i, j, k) / z0), 3) * kappa * kappa *
+                        u_interp * u_interp / vtmag;
+                    sarr(i, j, k, 0) += divt * vtan[0];
+                    sarr(i, j, k, 1) += divt * vtan[1];
+                    sarr(i, j, k, 2) += divt * vtan[2];
                 }
             });
     }
